@@ -18,6 +18,7 @@ import { z } from 'zod'
 
 import type { AppConfig, StatePaths } from '../config.js'
 import type { Logger } from '../log.js'
+import { withRetry, type RetryOptions } from '../net/retry.js'
 import type { StatusManager, StatusState } from '../status/status-manager.js'
 import {
   DownloadAttachmentArgsSchema,
@@ -125,7 +126,11 @@ export interface TelegramApi {
 
 // Thin wrapper around grammY bot.api. Keeps the rest of the system free of
 // grammy-specific quirks (reply_parameters vs reply_to_message_id, etc).
-export function createTelegramApi(bot: Bot, token: string): TelegramApi {
+//
+// Every outbound call goes through withRetry: this machine runs five agents
+// and a video editor, and when ffmpeg is working the short calls to Telegram
+// start timing out. `retry` is injected only by tests, to skip the pauses.
+export function createTelegramApi(bot: Bot, token: string, retry: RetryOptions = {}): TelegramApi {
   return {
     async sendMessage(chatId, text, opts) {
       const other: Record<string, unknown> = {}
@@ -138,7 +143,7 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
       if (opts.reply_markup !== undefined) {
         other.reply_markup = opts.reply_markup
       }
-      const sent = await bot.api.sendMessage(chatId, text, other)
+      const sent = await withRetry(() => bot.api.sendMessage(chatId, text, other), retry)
       return { message_id: sent.message_id }
     },
     async editMessageText(chatId, messageId, text, opts) {
@@ -160,7 +165,12 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
       if (opts.caption !== undefined) other.caption = opts.caption
-      const sent = await bot.api.sendDocument(chatId, new InputFile(filePath), other)
+      // A fresh InputFile per attempt: the previous one may have been read
+      // to the end before the connection died.
+      const sent = await withRetry(
+        () => bot.api.sendDocument(chatId, new InputFile(filePath), other),
+        retry,
+      )
       return { message_id: sent.message_id }
     },
     async sendPhoto(chatId, filePath, opts) {
@@ -169,19 +179,24 @@ export function createTelegramApi(bot: Bot, token: string): TelegramApi {
         other.reply_parameters = { message_id: opts.reply_to_message_id }
       }
       if (opts.caption !== undefined) other.caption = opts.caption
-      const sent = await bot.api.sendPhoto(chatId, new InputFile(filePath), other)
+      const sent = await withRetry(
+        () => bot.api.sendPhoto(chatId, new InputFile(filePath), other),
+        retry,
+      )
       return { message_id: sent.message_id }
     },
     async deleteMessage(chatId, messageId) {
       await bot.api.deleteMessage(chatId, messageId)
     },
     async downloadFile(fileId, destDir) {
-      const file = await bot.api.getFile(fileId)
+      const file = await withRetry(() => bot.api.getFile(fileId), retry)
       if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
       const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`
-      const res = await fetch(url)
-      if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
-      const buf = Buffer.from(await res.arrayBuffer())
+      const buf = await withRetry(async () => {
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+        return Buffer.from(await res.arrayBuffer())
+      }, retry)
       const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop() ?? 'bin' : 'bin'
       const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
       const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
