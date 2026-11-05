@@ -17,6 +17,7 @@
 
 import { escapeHtmlAttr } from '../format/html.js'
 import type { AppConfig } from '../config.js'
+import { withRetry, type RetryOptions } from '../net/retry.js'
 
 // ─────────────────────────────────────────────────────────────────────
 // MediaDescriptor — discriminated union over the eight media kinds the
@@ -220,6 +221,9 @@ export interface VoiceTranscriptionInput {
   fetchImpl?: typeof fetch
   // Optional file-reader override so unit tests can avoid touching disk.
   readFile?: (path: string) => Promise<Uint8Array>
+  // Retry policy for the download and the transcription request. Tests pass
+  // a no-op sleep; production takes the defaults.
+  retry?: RetryOptions
 }
 
 export interface VoiceTranscriptionResult {
@@ -265,8 +269,13 @@ export async function maybeTranscribeVoice(
 
   const fetchFn = input.fetchImpl ?? fetch
 
+  const retry = input.retry ?? {}
+
   try {
-    const downloaded = await input.downloadFile(input.fileId)
+    // The download dies first when the host runs out of memory, and it is
+    // the cheapest thing to repeat: her voice message of 05.11.2026 arrived
+    // without a transcript for exactly this reason.
+    const downloaded = await withRetry(() => input.downloadFile(input.fileId), retry)
 
     // Re-check actual size after download — Telegram metadata can lag.
     if (downloaded.size !== undefined && downloaded.size > GROQ_MAX_BYTES) {
@@ -287,7 +296,6 @@ export async function maybeTranscribeVoice(
       bytes = await fs.readFile(downloaded.path)
     }
 
-    const form = new FormData()
     // Groq Whisper validates by FILENAME extension and rejects `.oga` even
     // though the bytes are valid Ogg/Opus. Telegram voice messages always
     // arrive with the `.oga` extension. Normalize to `.ogg` so the server
@@ -295,30 +303,37 @@ export async function maybeTranscribeVoice(
     const rawName = downloaded.path.split('/').pop() ?? 'voice.ogg'
     const filename = rawName.replace(/\.oga$/i, '.ogg')
     const mime = downloaded.mime ?? input.mime ?? 'audio/ogg'
-    form.append('file', new Blob([new Uint8Array(bytes)], { type: mime }), filename)
-    form.append('model', config.voice.model)
-    form.append('language', config.voice.language)
-    form.append('response_format', 'text')
 
-    const res = await fetchFn('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${key}` },
-      body: form,
-    })
+    // Each attempt builds its own FormData: a body that was already streamed
+    // cannot be sent a second time.
+    const text = await withRetry(async () => {
+      const form = new FormData()
+      form.append('file', new Blob([new Uint8Array(bytes)], { type: mime }), filename)
+      form.append('model', config.voice.model)
+      form.append('language', config.voice.language)
+      form.append('response_format', 'text')
 
-    if (!res.ok) {
-      // Read body for diagnostic but redact the key just in case the
-      // server echoes the Authorization header (some misconfigured proxies
-      // do). Truncate to 200 chars like gateway.py:927.
-      const rawBody = await res.text().catch(() => '')
-      const safeBody = redactGroqKey(rawBody, key).slice(0, 200)
-      return {
-        status: 'failed',
-        errorMessage: `groq HTTP ${res.status}: ${safeBody}`,
+      const res = await fetchFn('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}` },
+        body: form,
+      })
+
+      if (!res.ok) {
+        // Read body for diagnostic but redact the key just in case the
+        // server echoes the Authorization header (some misconfigured proxies
+        // do). Truncate to 200 chars like gateway.py:927.
+        const rawBody = await res.text().catch(() => '')
+        const safeBody = redactGroqKey(rawBody, key).slice(0, 200)
+        // Thrown, not returned: withRetry decides from the status whether
+        // another attempt makes sense, and the catch below turns whatever
+        // survives into the same `failed` result as before.
+        throw new Error(`groq HTTP ${res.status}: ${safeBody}`)
       }
-    }
 
-    const text = (await res.text()).trim()
+      return (await res.text()).trim()
+    }, retry)
+
     if (text.length === 0) {
       // Empty transcript = the audio was silent or unintelligible. Not
       // a failure of the pipeline — surface it as status=ok with empty
